@@ -12,6 +12,8 @@ use aws_sdk_ec2::Client as Ec2Client;
 use aws_types::region::Region;
 use aws_types::SdkConfig;
 use coldsnap::{SnapshotDownloader, SnapshotUploader, SnapshotWaiter, WaitParams};
+#[cfg(feature = "filesystem")]
+use coldsnap::{SnapshotFilesystem};
 use env_logger::{Builder, Env};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, LevelFilter};
@@ -69,6 +71,26 @@ async fn run() -> Result<()> {
                 )
                 .await
                 .context(error::DownloadSnapshotSnafu)?;
+        }
+
+        #[cfg(feature = "filesystem")]
+        SubCommand::ListFiles(list_files_args) => {
+            let client = EbsClient::new(&client_config);
+            let filesystem = SnapshotFilesystem::new(client.clone());
+            filesystem
+                .list_files(&list_files_args.snapshot_id, list_files_args.path)
+                .await
+                .context(error::SnapshotFilesystemSnafu)?;
+        }
+
+        #[cfg(feature = "filesystem")]
+        SubCommand::ReadFile(read_file_args) => {
+            let client = EbsClient::new(&client_config);
+            let filesystem = SnapshotFilesystem::new(client.clone());
+            filesystem
+                .read_file(&read_file_args.snapshot_id, read_file_args.path)
+                .await
+                .context(error::SnapshotFilesystemSnafu)?;
         }
 
         SubCommand::Upload(upload_args) => {
@@ -245,6 +267,11 @@ enum SubCommand {
     Download(DownloadArgs),
     Upload(UploadArgs),
     Wait(WaitArgs),
+
+    #[cfg(feature = "filesystem")]
+    ListFiles(ListFilesArgs),
+    #[cfg(feature = "filesystem")]
+    ReadFile(ReadFileArgs),
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -264,6 +291,28 @@ struct DownloadArgs {
     #[argh(switch)]
     /// disable the progress bar
     no_progress: bool,
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "list-files")]
+/// List files from an supported filesystem on an EBS snapshot.
+struct ListFilesArgs {
+    #[argh(positional)]
+    snapshot_id: String,
+
+    #[argh(positional)]
+    path: PathBuf,
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "read-file")]
+/// Read a file from an supported filesystem on an EBS snapshot.
+struct ReadFileArgs {
+    #[argh(positional)]
+    snapshot_id: String,
+
+    #[argh(positional)]
+    path: PathBuf,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -332,6 +381,9 @@ mod error {
     pub(super) enum Error {
         #[snafu(display("Failed to download snapshot: {}", source))]
         DownloadSnapshot { source: coldsnap::DownloadError },
+
+        #[snafu(display("Failed to download snapshot: {}", source))]
+        SnapshotFilesystemError { source: coldsnap::SnapshotFilesystemError },
 
         #[snafu(display("Refusing to overwrite existing file '{}' without --force", path.display()))]
         FileExists { path: std::path::PathBuf },

@@ -61,11 +61,18 @@ mod download;
 mod upload;
 mod wait;
 
+#[cfg(feature = "filesystem")]
+mod filesystem;
+
 pub use download::Error as DownloadError;
 pub use download::SnapshotDownloader;
 
 pub use upload::Error as UploadError;
 pub use upload::SnapshotUploader;
+
+#[cfg(feature = "filesystem")]
+pub use filesystem::SnapshotFilesystem;
+pub use filesystem::Error as SnapshotFilesystemError;
 
 pub use wait::Error as WaitError;
 pub use wait::{SnapshotWaiter, WaitParams};

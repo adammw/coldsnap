@@ -1,0 +1,520 @@
+use std::collections::HashMap;
+use aws_sdk_ebs::Client as EbsClient;
+use positioned_io2::{ReadAt, Size};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::convert::TryFrom;
+use std::fmt::Formatter;
+use std::io::{ErrorKind, SeekFrom, stdout, Write};
+use std::ops::Deref;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use super::download::{SnapshotDownloader, Snapshot};
+use bytes::{Buf, Bytes};
+use stretto::{AsyncCache, CacheError};
+use color_eyre::eyre;
+
+use ext4_rs_nom::Ext4Volume;
+
+use gpt;
+
+#[derive(Debug, Snafu)]
+pub struct Error(error::Error);
+
+const SNAPSHOT_BLOCK_WORKERS: usize = 1;
+const SNAPSHOT_BLOCK_ATTEMPTS: u8 = 3;
+const SHA256_ALGORITHM: &str = "SHA256";
+const GIBIBYTE: i64 = 1024 * 1024 * 1024;
+
+impl From<super::download::Error> for Error {
+    fn from(err: super::download::Error) -> Self {
+        Error::from(error::Error::DownloadError { source: err })
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::from(error::Error::StdIoError { source: err })
+    }
+}
+
+impl From<CacheError> for Error {
+    fn from(err: CacheError) -> Self {
+        Error::from(error::Error::CacheError { source: err })
+    }
+}
+
+impl From<eyre::Report> for Error {
+    fn from(err: eyre::Report) -> Self {
+        Error::from(error::Error::EyreError { source: err })
+    }
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+pub struct SnapshotFilesystem {
+    ebs_client: EbsClient,
+}
+
+impl SnapshotFilesystem {
+    pub fn new(ebs_client : EbsClient) -> Self {
+        SnapshotFilesystem { ebs_client }
+    }
+
+    async fn extract_volume(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Ext4Volume<SnapshotReader>> {
+        let snapshot_reader = SnapshotReader::new(self.ebs_client.clone(), snapshot_id).await?;
+
+        let disk = gpt::GptConfig::new().writable(false).open_from_device(Box::new(snapshot_reader))?;
+        // println!("Disk (primary) header: {:#?}", disk.primary_header());
+        // println!("Partition layout: {:#?}", disk.partitions());
+
+        let (_, partition) = disk
+            .partitions()
+            .iter()
+            .find(|(_, p)| p.part_type_guid.guid == "0FC63DAF-8483-4772-8E79-3D69D8477DE4")
+            .ok_or(error::Error::PartitionError {})?;
+
+        let partition_start = partition.first_lba * u64::from(*disk.logical_block_size());
+        let snapshot_reader = SnapshotReader::new(self.ebs_client.clone(), snapshot_id).await?; // todo don't create a second
+        let ext4volume = Ext4Volume::new(snapshot_reader.with_offset(partition_start))?;
+        Ok(ext4volume)
+    }
+
+    /// Download a snapshot into the file at the specified path.
+    /// * `snapshot_id` is the snapshot to download.
+    /// * `path` is the path prefix to start listing files from
+    pub async fn list_files<P: AsRef<Path>>(
+        &self,
+        snapshot_id: &str,
+        path: P,
+    ) -> Result<()> {
+        let path = path.as_ref().display().to_string();
+
+        let ext4volume = self.extract_volume(snapshot_id).await?;
+
+        let root = ext4volume.resolve_path(path.as_str())?;
+        ext4volume.walk(&root, "/", &mut |_, path, _| {
+            println!("{}", path);
+            Ok(true)
+        })?;
+
+        Ok(())
+    }
+
+    pub async fn read_file<P: AsRef<Path>>(
+        &self,
+        snapshot_id: &str,
+        path: P,
+    ) -> Result<()> {
+
+        let path = path.as_ref().display().to_string();
+        let ext4volume = self.extract_volume(snapshot_id).await?;
+
+        let inode = ext4volume.resolve_path(path.as_str())?;
+        for mut data in ext4volume.data(&inode)? {
+            let mut out = stdout();
+            let mut cursor = positioned_io2::Cursor::new(&mut data);
+            std::io::copy(&mut cursor, &mut out).expect("TODO: panic message");
+        }
+
+        Ok(())
+    }
+}
+
+/// Stores the context needed to download a snapshot block.
+struct BlockContext<'a> {
+    output_buffer: &'a mut [u8],
+    block_index: i32,
+    block_token: String,
+    block_size: i32,
+    snapshot_id: String,
+    ebs_client: EbsClient,
+    cache: &'a AsyncCache<i32, Bytes>
+}
+
+/// Download a single block from the snapshot in context and write it to the file.
+async fn download_block(context: &BlockContext<'_>) -> Result<Bytes> {
+    let ebs_client = &context.ebs_client;
+    let snapshot_id = &context.snapshot_id;
+    let block_index = context.block_index;
+    let block_token = &context.block_token;
+    let block_size = context.block_size;
+
+    if let Some(val) = context.cache.get(&block_index) {
+        return Ok(val.as_ref().clone())
+    }
+
+    // TODO: block mutal downloads from happening
+
+    let response = ebs_client
+        .get_snapshot_block()
+        .snapshot_id(snapshot_id)
+        .block_index(block_index)
+        .block_token(block_token)
+        .send()
+        .await
+        .context(error::GetSnapshotBlockSnafu {
+            snapshot_id,
+            block_index,
+        })?;
+
+    let expected_hash = response.checksum.context(error::FindBlockPropertySnafu {
+        snapshot_id,
+        block_index,
+        property: "checksum",
+    })?;
+
+    let checksum_algorithm = response
+        .checksum_algorithm
+        .context(error::FindBlockPropertySnafu {
+            snapshot_id,
+            block_index,
+            property: "checksum algorithm",
+        })?
+        .as_str()
+        .to_string();
+
+    let data_length = response
+        .data_length
+        .context(error::FindBlockPropertySnafu {
+            snapshot_id,
+            block_index,
+            property: "data length",
+        })?;
+
+    let block_data_stream =
+        response
+            .block_data
+            .collect()
+            .await
+            .context(error::CollectByteStreamSnafu {
+                snapshot_id,
+                block_index,
+                property: "data",
+            })?;
+
+    let block_data = block_data_stream.into_bytes();
+
+    ensure!(
+        checksum_algorithm == SHA256_ALGORITHM,
+        error::UnexpectedBlockChecksumAlgorithmSnafu {
+            snapshot_id,
+            block_index,
+            checksum_algorithm,
+        }
+    );
+    let block_data_length = block_data.len();
+    let block_data_length =
+        i32::try_from(block_data_length).with_context(|_| error::ConvertNumberSnafu {
+            what: "block data length",
+            number: block_data_length.to_string(),
+            target: "i32",
+        })?;
+
+    ensure!(
+        data_length > 0 && data_length <= block_size && data_length == block_data_length,
+        error::UnexpectedBlockDataLengthSnafu {
+            snapshot_id,
+            block_index,
+            data_length,
+        }
+    );
+
+    let mut block_digest = Sha256::new();
+    block_digest.update(&block_data);
+    let hash_bytes = block_digest.finalize();
+    let block_hash = base64::encode(&hash_bytes);
+
+    ensure!(
+        block_hash == expected_hash,
+        error::BadBlockChecksumSnafu {
+            snapshot_id,
+            block_index,
+            block_hash,
+            expected_hash,
+        }
+    );
+
+    context.cache.insert(block_index, block_data.clone(), 1).await;
+
+    Ok(block_data)
+}
+
+struct SnapshotReader {
+    ebs_client: EbsClient,
+    snapshot: Snapshot,
+    internal_offset: u64,
+    cur_offset: u64,
+    cache: AsyncCache<i32, Bytes>,
+}
+
+impl SnapshotReader {
+    pub async fn new(ebs_client: EbsClient, snapshot_id: &str) -> Result<Self> {
+        let downloader = SnapshotDownloader::new(ebs_client.clone());
+        let snapshot = downloader.list_snapshot_blocks(snapshot_id).await?;
+
+        let cache: AsyncCache<i32, Bytes> = AsyncCache::new(12960, 1e6 as i64, tokio::spawn)?;
+
+        Ok(SnapshotReader { ebs_client, snapshot, internal_offset: 0, cur_offset: 0, cache })
+    }
+
+    fn clone(&self) -> SnapshotReader {
+        self.with_offset(0)
+    }
+
+    fn with_offset(&self, offset: u64) -> SnapshotReader {
+        SnapshotReader {
+            ebs_client: self.ebs_client.clone(),
+            snapshot: self.snapshot.clone(),
+            internal_offset: self.internal_offset + offset,
+            cur_offset: 0,
+            cache: self.cache.clone(),
+        }
+    }
+
+    async fn read_at_async(&self, pos: u64, buf: &mut [u8]) -> Result<usize> {
+        let buf_size = buf.len();
+        let end_byte = (pos as usize) + buf_size;
+        let block_size = self.snapshot.block_size as usize;
+        let start_block: i32 = ((pos as u64) / (block_size as u64)) as i32;
+        let start_block_offset: usize = ((pos as u64) % (block_size as u64)) as usize;
+        let end_block_offset: usize = ((end_byte as u64) % (block_size as u64)) as usize;
+        let end_block: i32 = ((end_byte as u64) / (block_size as u64)) as i32; // off by 1?
+
+        // TODO: probably some optimisations available here, e.g. don't paginate the whole thing if we only need some of it
+        // also can tokens go out of date?
+        let block_map: HashMap<i32, String> = self.snapshot.blocks.iter().map(|x| (x.index, x.token.clone())).collect();
+
+        let mut block_contexts = Vec::with_capacity(block_map.len());
+
+        let mut buf_offset = 0;
+        let mut block_index = start_block;
+        let mut existing: &mut [u8];
+        let mut remaining: &mut [u8] = buf;
+
+        loop {
+            (existing, remaining) = remaining.split_at_mut(buf_offset);
+
+            let mut size : usize = block_size;
+            if block_index == end_block {
+                size = end_block_offset;
+            }
+            if block_index == start_block {
+                size -= start_block_offset;
+            }
+
+            let block_output : &mut [u8];
+            (block_output, remaining) = remaining.split_at_mut(buf_offset + size);
+
+            block_contexts.push(BlockContext {
+                output_buffer: block_output,
+                block_index,
+                block_token: block_map[&block_index].clone(),
+                block_size: block_size as i32,
+                snapshot_id: self.snapshot.snapshot_id.clone(),
+                ebs_client: self.ebs_client.clone(),
+                cache: &self.cache,
+            });
+
+            block_index += 1;
+            buf_offset += size;
+            if buf_offset >= buf_size {
+                break;
+            }
+        }
+
+        let stream =  stream::iter(block_contexts).map(|ctx| -> Result<BlockContext> { Ok(ctx) });
+        let download = stream.try_for_each_concurrent(
+            SNAPSHOT_BLOCK_WORKERS,
+            |context| async move {
+                let mut block_data = download_block(&context).await?.clone();
+
+                if context.block_index == start_block {
+                   block_data.advance(start_block_offset);
+                }
+                if context.block_index == end_block {
+                   block_data.truncate(end_block_offset);
+                }
+                block_data.copy_to_slice(context.output_buffer);
+
+                Ok(())
+            },
+        );
+        download.await?;
+
+        Ok(buf.len())
+    }
+}
+
+impl std::fmt::Debug for SnapshotReader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SnapshotReader")
+         .field(&self.snapshot)
+         .field(&self.cur_offset)
+         .finish()
+    }
+}
+
+impl positioned_io2::ReadAt for SnapshotReader {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::result::Result<usize, std::io::Error> {
+        let f = self.read_at_async(self.internal_offset + pos, buf);
+        futures::executor::block_on(f).or_else(|err| -> std::result::Result<usize, std::io::Error> {
+            Err(std::io::Error::new(ErrorKind::Other, err.to_string()))
+        })
+    }
+}
+
+impl std::io::Read for SnapshotReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let bytes_read = self.read_at(self.cur_offset + self.internal_offset, buf)?;
+        self.cur_offset += bytes_read as u64;
+        Ok(bytes_read)
+    }
+}
+
+impl std::io::Seek for SnapshotReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match pos {
+            SeekFrom::Start(i) => { self.cur_offset = i as u64 }
+            SeekFrom::End(i) => { self.cur_offset = (self.snapshot.volume_size * GIBIBYTE) as u64 - i as u64 }
+            SeekFrom::Current(i) => { self.cur_offset = ((self.cur_offset as i64) + i) as u64 }
+        }
+        Ok(self.cur_offset)
+    }
+}
+
+impl std::io::Write for SnapshotReader {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        todo!()
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        todo!()
+    }
+}
+
+/// Potential errors while downloading a snapshot and writing to a local file.
+mod error {
+    use aws_sdk_ebs::{
+        self,
+        operation::get_snapshot_block::GetSnapshotBlockError,
+        operation::list_snapshot_blocks::ListSnapshotBlocksError,
+    };
+    use snafu::Snafu;
+    use std::path::PathBuf;
+
+    #[derive(Debug, Snafu)]
+    #[snafu(visibility(pub(super)))]
+    pub(super) enum Error {
+        #[snafu(display("Failed to read metadata for '{}': {}", path.display(), source))]
+        ReadFileMetadata {
+            path: PathBuf,
+            source: std::io::Error,
+        },
+
+        #[snafu(display("{}", source))]
+        StdIoError { source: std::io::Error },
+
+        #[snafu(display("{}", source))]
+        CacheError { source: stretto::CacheError },
+
+        #[snafu(display("{}", source))]
+        EyreError { source: color_eyre::eyre::Error },
+
+        #[snafu(display("{}", source))]
+        DownloadError { source: super::super::download::Error },
+
+        #[snafu(display("Failed to find Linux partition"))]
+        PartitionError { },
+
+        #[snafu(display(
+        "Failed to get block {} for snapshot '{}': {}",
+        block_index,
+        snapshot_id,
+        source
+        ))]
+        GetSnapshotBlock {
+            snapshot_id: String,
+            block_index: i64,
+            source: aws_smithy_http::result::SdkError<GetSnapshotBlockError>,
+        },
+
+        #[snafu(display(
+            "Failed to find {} for block {} in '{}'",
+            property,
+            block_index,
+            snapshot_id
+        ))]
+        FindBlockProperty {
+            snapshot_id: String,
+            block_index: i32,
+            property: String,
+        },
+
+        #[snafu(display(
+            "Failed to find {} for block {} in '{}'",
+            property,
+            block_index,
+            snapshot_id
+        ))]
+        CollectByteStream {
+            snapshot_id: String,
+            block_index: i32,
+            property: String,
+            source: aws_smithy_http::byte_stream::error::Error,
+        },
+
+
+        #[snafu(display("Failed to find block size for '{}'", snapshot_id))]
+        FindBlockSize { snapshot_id: String },
+
+        #[snafu(display(
+            "Found unexpected checksum algorithm '{}' for block {} in '{}'",
+            checksum_algorithm,
+            block_index,
+            snapshot_id
+        ))]
+        UnexpectedBlockChecksumAlgorithm {
+            snapshot_id: String,
+            block_index: i64,
+            checksum_algorithm: String,
+        },
+
+        #[snafu(display(
+            "Found unexpected data length {} for block {} in '{}'",
+            data_length,
+            block_index,
+            snapshot_id
+        ))]
+        UnexpectedBlockDataLength {
+            snapshot_id: String,
+            block_index: i64,
+            data_length: i64,
+        },
+
+        #[snafu(display(
+            "Bad checksum for block {} in '{}': expected '{}', got '{}'",
+            block_index,
+            snapshot_id,
+            expected_hash,
+            block_hash,
+        ))]
+        BadBlockChecksum {
+            snapshot_id: String,
+            block_index: i64,
+            block_hash: String,
+            expected_hash: String,
+        },
+
+        #[snafu(display("Failed to convert {} {} to {}: {}", what, number, target, source))]
+        ConvertNumber {
+            what: String,
+            number: String,
+            target: String,
+            source: std::num::TryFromIntError,
+        },
+    }
+}

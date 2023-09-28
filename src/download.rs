@@ -178,7 +178,7 @@ impl SnapshotDownloader {
     }
 
     /// Retrieve the index and token for all snapshot blocks.
-    async fn list_snapshot_blocks(&self, snapshot_id: &str) -> Result<Snapshot> {
+    pub async fn list_snapshot_blocks(&self, snapshot_id: &str) -> Result<Snapshot> {
         let mut blocks = Vec::new();
         let max_results = LIST_REQUEST_MAX_RESULTS;
         let mut next_token = None;
@@ -387,17 +387,19 @@ impl SnapshotDownloader {
 }
 
 /// Stores the metadata about the snapshot contents.
-struct Snapshot {
-    snapshot_id: String,
-    volume_size: i64,
-    block_size: i32,
-    blocks: Vec<SnapshotBlock>,
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub snapshot_id: String,
+    pub volume_size: i64,
+    pub(crate) block_size: i32,
+    pub(crate) blocks: Vec<SnapshotBlock>,
 }
 
 /// Stores the metadata about a snapshot block.
-struct SnapshotBlock {
-    index: i32,
-    token: String,
+#[derive(Clone, Debug)]
+pub struct SnapshotBlock {
+    pub index: i32,
+    pub token: String,
 }
 
 /// Stores the context needed to download a snapshot block.
@@ -698,10 +700,10 @@ mod error {
         },
 
         #[snafu(display(
-            "Failed to get block {} for snapshot '{}': {}",
-            block_index,
-            snapshot_id,
-            source
+        "Failed to get block {} for snapshot '{}': {}",
+        block_index,
+        snapshot_id,
+        source
         ))]
         GetSnapshotBlock {
             snapshot_id: String,
