@@ -595,6 +595,7 @@ dependencies = [
  "stretto",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1017,13 +1018,13 @@ checksum = "b6c80984affa11d98d1b88b66ac8853f143217b399d3c74116778ff8fdb4ed2e"
 
 [[package]]
 name = "gpt"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8283e7331b8c93b9756e0cfdbcfb90312852f953c6faf9bf741e684cc3b6ad69"
+version = "4.0.0-alpha.1"
+source = "git+https://github.com/Quyzi/gpt?rev=c0335be#c0335becfb868c1a9f57242587e6ae67c268fc1d"
 dependencies = [
  "bitflags 2.3.3",
  "crc",
  "log",
+ "simple-bytes",
  "uuid",
 ]
 
@@ -1931,6 +1932,12 @@ checksum = "c1b21f559e07218024e7e9f90f96f601825397de0e25420135f7f952453fed0b"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "simple-bytes"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c11532d9d241904f095185f35dcdaf930b1427a94d5b01d7002d74ba19b44cc4"
 
 [[package]]
 name = "slab"

@@ -18,7 +18,8 @@ use color_eyre::eyre;
 use ext4_rs_nom::Ext4Volume;
 
 use gpt;
-use crate::download::SnapshotBlock;
+use gpt::GptError;
+use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 pub struct Error(error::Error);
@@ -37,6 +38,18 @@ impl From<super::download::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::from(error::Error::StdIoError { source: err })
+    }
+}
+
+impl From<uuid::Error> for Error {
+    fn from(err: uuid::Error) -> Self {
+        Error::from(error::Error::UuidError { source: err })
+    }
+}
+
+impl From<GptError> for Error {
+    fn from(err: GptError) -> Self {
+        Error::from(error::Error::GptError { source: err })
     }
 }
 
@@ -69,19 +82,22 @@ impl SnapshotFilesystem {
     ) -> Result<Ext4Volume<SnapshotReader>> {
         let snapshot_reader = SnapshotReader::new(self.ebs_client.clone(), snapshot_id).await?;
 
-        let disk = gpt::GptConfig::new().writable(false).open_from_device(Box::new(snapshot_reader))?;
+        // only read initial part of disk to avoid loading entire disk just to read backup header
+        let gpt_reader = snapshot_reader.with_offset(0, Some(4096 * 33));
+        let disk = gpt::GptConfig::new().writable(false).open_from_device(Box::new(gpt_reader))?;
         // println!("Disk (primary) header: {:#?}", disk.primary_header());
         // println!("Partition layout: {:#?}", disk.partitions());
+
+        let ext4Uuid = Uuid::parse_str("0FC63DAF-8483-4772-8E79-3D69D8477DE4")?;
 
         let (_, partition) = disk
             .partitions()
             .iter()
-            .find(|(_, p)| p.part_type_guid.guid == "0FC63DAF-8483-4772-8E79-3D69D8477DE4")
+            .find(|(_, p)| p.part_type_guid.guid == ext4Uuid)
             .ok_or(error::Error::PartitionError {})?;
 
         let partition_start = partition.first_lba * u64::from(*disk.logical_block_size());
-        let snapshot_reader = SnapshotReader::new(self.ebs_client.clone(), snapshot_id).await?; // todo don't create a second
-        let ext4volume = Ext4Volume::new(snapshot_reader.with_offset(partition_start))?;
+        let ext4volume = Ext4Volume::new(snapshot_reader.with_offset(partition_start, None))?;
         Ok(ext4volume)
     }
 
@@ -251,6 +267,7 @@ struct SnapshotReader {
     block_map: RefCell<StreamingBlockMap>,
     internal_offset: u64,
     cur_offset: u64,
+    max_offset: Option<u64>,
     cache: AsyncCache<i32, Bytes>,
 }
 
@@ -281,21 +298,23 @@ impl SnapshotReader {
             block_map: RefCell::new(block_map),
             internal_offset: 0,
             cur_offset: 0,
+            max_offset: None,
             cache
         })
     }
 
     fn clone(&self) -> SnapshotReader {
-        self.with_offset(0)
+        self.with_offset(0, None)
     }
 
-    fn with_offset(&self, offset: u64) -> SnapshotReader {
+    fn with_offset(&self, offset: u64, end: Option<u64>) -> SnapshotReader {
         SnapshotReader {
             ebs_client: self.ebs_client.clone(),
             snapshot: self.snapshot.clone(),
             block_map: self.block_map.clone(),
             internal_offset: self.internal_offset + offset,
             cur_offset: 0,
+            max_offset: end,
             cache: self.cache.clone(),
         }
     }
@@ -358,13 +377,24 @@ impl SnapshotReader {
 
     async fn read_at_async(&self, pos: u64, buf: &mut [u8]) -> Result<usize> {
         let buf_size = buf.len();
-        let end_byte = (pos as usize) + buf_size;
+        let mut end_byte = (pos as usize) + buf_size;
+        if let Some(end) = self.max_offset {
+            if pos >= end {
+                return Err(Error::from(error::Error::ReadOutOfBounds { offset: pos }))
+            }
+            if end_byte > end as usize {
+                end_byte = end as usize;
+            }
+        }
+
         let block_size = self.snapshot.block_size as usize;
         let start_block: i32 = ((pos as u64) / (block_size as u64)) as i32;
         let start_block_offset: usize = ((pos as u64) % (block_size as u64)) as usize;
         let end_block_offset: usize = ((end_byte as u64) % (block_size as u64)) as usize;
         let end_block: i32 = ((end_byte as u64) / (block_size as u64)) as i32; // off by 1?
         let block_count = (end_block - start_block) as usize;
+
+
 
         let mut block_contexts = Vec::with_capacity(block_count);
         let mut buf_offset = 0;
@@ -485,6 +515,7 @@ mod error {
     };
     use snafu::Snafu;
     use std::path::PathBuf;
+    use gpt::GptError;
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub(super)))]
@@ -500,6 +531,12 @@ mod error {
 
         #[snafu(display("{}", source))]
         CacheError { source: stretto::CacheError },
+
+        #[snafu(display("{}", source))]
+        UuidError { source: uuid::Error },
+
+        #[snafu(display("{}", source))]
+        GptError { source: GptError },
 
         #[snafu(display("{}", source))]
         EyreError { source: color_eyre::eyre::Error },
@@ -566,6 +603,8 @@ mod error {
             source: aws_smithy_http::byte_stream::error::Error,
         },
 
+        #[snafu(display("Read past end of exposed slice 0x{:x}", offset))]
+        ReadOutOfBounds { offset: u64 },
 
         #[snafu(display("Failed to find block size for '{}'", snapshot_id))]
         FindBlockSize { snapshot_id: String },
