@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use aws_sdk_ebs::Client as EbsClient;
 use positioned_io2::{ReadAt, Size};
@@ -7,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use std::fmt::Formatter;
 use std::io::{ErrorKind, SeekFrom, stdout, Write};
-use std::ops::Deref;
+use std::ops::{Deref, Index};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use super::download::{SnapshotDownloader, Snapshot};
 use bytes::{Buf, Bytes};
@@ -17,6 +18,7 @@ use color_eyre::eyre;
 use ext4_rs_nom::Ext4Volume;
 
 use gpt;
+use crate::download::SnapshotBlock;
 
 #[derive(Debug, Snafu)]
 pub struct Error(error::Error);
@@ -246,19 +248,41 @@ async fn download_block(context: &BlockContext<'_>) -> Result<Bytes> {
 struct SnapshotReader {
     ebs_client: EbsClient,
     snapshot: Snapshot,
+    block_map: RefCell<StreamingBlockMap>,
     internal_offset: u64,
     cur_offset: u64,
     cache: AsyncCache<i32, Bytes>,
 }
 
+#[derive(Clone)]
+struct StreamingBlockMap {
+    block_map: HashMap<i32, String>,
+    block_map_complete: bool,
+    next_token: Option<String>,
+}
+
 impl SnapshotReader {
     pub async fn new(ebs_client: EbsClient, snapshot_id: &str) -> Result<Self> {
-        let downloader = SnapshotDownloader::new(ebs_client.clone());
-        let snapshot = downloader.list_snapshot_blocks(snapshot_id).await?;
+        let downloader = SnapshotDownloader::new( ebs_client.clone());
+
+        // preload snapshot metadata and first 100 blocks
+        let snapshot = downloader.list_snapshot_blocks(snapshot_id, Some(100)).await?;
+        let block_map = StreamingBlockMap {
+            block_map: snapshot.blocks.iter().map(|x| (x.index, x.token.clone())).collect(),
+            block_map_complete: false,
+            next_token: None,
+        };
 
         let cache: AsyncCache<i32, Bytes> = AsyncCache::new(12960, 1e6 as i64, tokio::spawn)?;
 
-        Ok(SnapshotReader { ebs_client, snapshot, internal_offset: 0, cur_offset: 0, cache })
+        Ok(SnapshotReader {
+            ebs_client,
+            snapshot,
+            block_map: RefCell::new(block_map),
+            internal_offset: 0,
+            cur_offset: 0,
+            cache
+        })
     }
 
     fn clone(&self) -> SnapshotReader {
@@ -269,10 +293,67 @@ impl SnapshotReader {
         SnapshotReader {
             ebs_client: self.ebs_client.clone(),
             snapshot: self.snapshot.clone(),
+            block_map: self.block_map.clone(),
             internal_offset: self.internal_offset + offset,
             cur_offset: 0,
             cache: self.cache.clone(),
         }
+    }
+
+    async fn get_block_token(&self, block_index: i32) -> Result<String> {
+        if let Some(token) = self.block_map.borrow().block_map.get(&block_index) {
+            return Ok(token.clone())
+        }
+
+        let mut found_block : Option<String> = None;
+        let snapshot_id = self.snapshot.snapshot_id.as_str();
+
+        let mut block_map = self.block_map.borrow_mut();
+
+        while !block_map.block_map_complete {
+            let response = self
+                .ebs_client
+                .list_snapshot_blocks()
+                .snapshot_id(snapshot_id)
+                .set_next_token(block_map.next_token.clone())
+                .max_results(crate::download::LIST_REQUEST_MAX_RESULTS)
+                .send()
+                .await
+                .context(error::ListSnapshotBlocksSnafu { snapshot_id })?;
+
+            let blocks = response.blocks.unwrap_or_default();
+            println!("ListSnapshotBlocks {} - {}", blocks[0].block_index.unwrap(), blocks.last().unwrap().block_index.unwrap());
+
+            for block in blocks.iter() {
+                let index = block
+                    .block_index
+                    .context(error::FindBlockIndexSnafu { snapshot_id })?;
+
+                let token = String::from(block.block_token.as_ref().context(
+                    error::FindBlockPropertySnafu {
+                        snapshot_id,
+                        block_index: index,
+                        property: "token",
+                    },
+                )?);
+
+                block_map.block_map.insert(index, token.clone());
+
+                if index == block_index {
+                    found_block = Some(token);
+                }
+            }
+
+            block_map.next_token = response.next_token;
+            if block_map.next_token.is_none() {
+                block_map.block_map_complete = true
+            }
+            if found_block.is_some() {
+                break;
+            }
+        }
+
+        Ok(found_block.context(error::FindBlockSnafu { snapshot_id, block_index })?)
     }
 
     async fn read_at_async(&self, pos: u64, buf: &mut [u8]) -> Result<usize> {
@@ -283,13 +364,9 @@ impl SnapshotReader {
         let start_block_offset: usize = ((pos as u64) % (block_size as u64)) as usize;
         let end_block_offset: usize = ((end_byte as u64) % (block_size as u64)) as usize;
         let end_block: i32 = ((end_byte as u64) / (block_size as u64)) as i32; // off by 1?
+        let block_count = (end_block - start_block) as usize;
 
-        // TODO: probably some optimisations available here, e.g. don't paginate the whole thing if we only need some of it
-        // also can tokens go out of date?
-        let block_map: HashMap<i32, String> = self.snapshot.blocks.iter().map(|x| (x.index, x.token.clone())).collect();
-
-        let mut block_contexts = Vec::with_capacity(block_map.len());
-
+        let mut block_contexts = Vec::with_capacity(block_count);
         let mut buf_offset = 0;
         let mut block_index = start_block;
         let mut existing: &mut [u8];
@@ -309,10 +386,13 @@ impl SnapshotReader {
             let block_output : &mut [u8];
             (block_output, remaining) = remaining.split_at_mut(buf_offset + size);
 
+
+            let block_token = self.get_block_token(block_index).await?;
+
             block_contexts.push(BlockContext {
                 output_buffer: block_output,
                 block_index,
-                block_token: block_map[&block_index].clone(),
+                block_token,
                 block_size: block_size as i32,
                 snapshot_id: self.snapshot.snapshot_id.clone(),
                 ebs_client: self.ebs_client.clone(),
@@ -326,7 +406,7 @@ impl SnapshotReader {
             }
         }
 
-        let stream =  stream::iter(block_contexts).map(|ctx| -> Result<BlockContext> { Ok(ctx) });
+        let stream = stream::iter(block_contexts).map(|ctx| -> Result<BlockContext> { Ok(ctx) });
         let download = stream.try_for_each_concurrent(
             SNAPSHOT_BLOCK_WORKERS,
             |context| async move {
@@ -439,7 +519,26 @@ mod error {
         GetSnapshotBlock {
             snapshot_id: String,
             block_index: i64,
-            source: aws_smithy_http::result::SdkError<GetSnapshotBlockError>,
+            source: aws_sdk_ebs::error::SdkError<GetSnapshotBlockError>,
+        },
+
+        #[snafu(display("Failed to list snapshot blocks '{}': {}", snapshot_id, source))]
+        ListSnapshotBlocks {
+            snapshot_id: String,
+            source: aws_sdk_ebs::error::SdkError<ListSnapshotBlocksError>,
+        },
+
+        #[snafu(display("Failed to find index for block in '{}'", snapshot_id))]
+        FindBlockIndex { snapshot_id: String },
+
+        #[snafu(display(
+            "Failed to block {} for snapshot '{}'",
+            block_index,
+            snapshot_id
+        ))]
+        FindBlock {
+            snapshot_id: String,
+            block_index: i32,
         },
 
         #[snafu(display(

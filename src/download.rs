@@ -5,6 +5,7 @@
 Download Amazon EBS snapshots.
 */
 
+use std::cmp::max;
 use crate::block_device::get_block_device_size;
 use async_trait::async_trait;
 use aws_sdk_ebs::Client as EbsClient;
@@ -38,7 +39,7 @@ const SHA256_ALGORITHM: &str = "SHA256";
 // query, from the default of 100 to the maximum of 10000. Since we fetch all
 // the block information up front in a loop, we ask for the maximum so that we
 // need fewer API calls.
-const LIST_REQUEST_MAX_RESULTS: i32 = 10000;
+pub(crate) const LIST_REQUEST_MAX_RESULTS: i32 = 10000;
 
 pub struct SnapshotDownloader {
     ebs_client: EbsClient,
@@ -69,7 +70,7 @@ impl SnapshotDownloader {
         // Find the overall volume size, the block size, and the metadata we need for each block:
         // the index, which lets us calculate the offset into the volume; and the token, which we
         // need to retrieve it.
-        let snapshot: Snapshot = self.list_snapshot_blocks(snapshot_id).await?;
+        let snapshot: Snapshot = self.list_snapshot_blocks(snapshot_id, None).await?;
 
         let mut target = if BlockDeviceTarget::is_valid(path).await? {
             BlockDeviceTarget::new_target(path)?
@@ -178,9 +179,13 @@ impl SnapshotDownloader {
     }
 
     /// Retrieve the index and token for all snapshot blocks.
-    pub async fn list_snapshot_blocks(&self, snapshot_id: &str) -> Result<Snapshot> {
+    pub async fn list_snapshot_blocks(&self, snapshot_id: &str, max_blocks: Option<i32>) -> Result<Snapshot> {
         let mut blocks = Vec::new();
-        let max_results = LIST_REQUEST_MAX_RESULTS;
+        let max_results = if max_blocks.is_some() && max_blocks.unwrap() < LIST_REQUEST_MAX_RESULTS {
+            max_blocks.unwrap()
+        } else {
+            LIST_REQUEST_MAX_RESULTS
+        };
         let mut next_token = None;
         let mut volume_size;
         let mut block_size;
@@ -218,6 +223,10 @@ impl SnapshotDownloader {
                 )?);
 
                 blocks.push(SnapshotBlock { index, token });
+            }
+
+            if max_blocks.is_some() && blocks.len() as i32 >= max_blocks.unwrap() {
+                break;
             }
 
             next_token = response.next_token;
