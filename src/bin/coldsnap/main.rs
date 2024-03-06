@@ -7,7 +7,7 @@ snapshots.
 */
 
 use argh::FromArgs;
-use aws_sdk_ebs::Client as EbsClient;
+use aws_sdk_ebs::{Client as EbsClient, config};
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_types::region::Region;
 use aws_types::SdkConfig;
@@ -20,6 +20,7 @@ use log::{debug, LevelFilter};
 use snafu::{ensure, ResultExt};
 use std::path::PathBuf;
 use std::time::Duration;
+use aws_config::retry::RetryConfig;
 
 type Result<T> = std::result::Result<T, error::Error>;
 
@@ -75,8 +76,12 @@ async fn run() -> Result<()> {
 
         #[cfg(feature = "filesystem")]
         SubCommand::ListFiles(list_files_args) => {
-            let client = EbsClient::new(&client_config);
-            let filesystem = SnapshotFilesystem::new(client.clone());
+            // let retry_config = RetryConfig::standard()
+            //     .with_initial_backoff(Duration::from_millis(20));
+            let retry_config = RetryConfig::disabled();
+            let config = config::Builder::from(&client_config).retry_config(retry_config).build();
+            let client = EbsClient::from_conf(config);
+            let filesystem = SnapshotFilesystem::new(client);
             filesystem
                 .list_files(&list_files_args.snapshot_id, list_files_args.path)
                 .await
@@ -86,7 +91,7 @@ async fn run() -> Result<()> {
         #[cfg(feature = "filesystem")]
         SubCommand::ReadFile(read_file_args) => {
             let client = EbsClient::new(&client_config);
-            let filesystem = SnapshotFilesystem::new(client.clone());
+            let filesystem = SnapshotFilesystem::new(client);
             filesystem
                 .read_file(&read_file_args.snapshot_id, read_file_args.path)
                 .await

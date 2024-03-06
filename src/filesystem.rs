@@ -9,6 +9,7 @@ use std::convert::TryFrom;
 use std::fmt::Formatter;
 use std::io::{ErrorKind, SeekFrom, stdout, Write};
 use std::ops::{Deref, Index};
+use std::time::Duration;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use super::download::{SnapshotDownloader, Snapshot};
 use bytes::{Buf, Bytes};
@@ -19,12 +20,14 @@ use ext4_rs_nom::Ext4Volume;
 
 use gpt;
 use gpt::GptError;
+use tokio::time::error::Elapsed;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 pub struct Error(error::Error);
 
-const SNAPSHOT_BLOCK_WORKERS: usize = 1;
+const SNAPSHOT_BLOCK_WORKERS: usize = 64;
 const SNAPSHOT_BLOCK_ATTEMPTS: u8 = 3;
 const SHA256_ALGORITHM: &str = "SHA256";
 const GIBIBYTE: i64 = 1024 * 1024 * 1024;
@@ -63,6 +66,10 @@ impl From<eyre::Report> for Error {
     fn from(err: eyre::Report) -> Self {
         Error::from(error::Error::EyreError { source: err })
     }
+}
+
+impl From<Elapsed> for Error {
+    fn from(err: Elapsed) -> Self { Error::from(error::Error::TimeoutError { source: err })}
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -109,13 +116,15 @@ impl SnapshotFilesystem {
         snapshot_id: &str,
         path: P,
     ) -> Result<()> {
-        let path = path.as_ref().display().to_string();
+        let base_path = path.as_ref().display().to_string();
 
         let ext4volume = self.extract_volume(snapshot_id).await?;
 
-        let root = ext4volume.resolve_path(path.as_str())?;
+        let root = ext4volume.resolve_path(base_path.as_str())?;
         ext4volume.walk(&root, "/", &mut |_, path, _| {
-            println!("{}", path);
+            if path != "/" {
+                println!("{}{}", base_path, path);
+            }
             Ok(true)
         })?;
 
@@ -166,18 +175,35 @@ async fn download_block(context: &BlockContext<'_>) -> Result<Bytes> {
     }
 
     // TODO: block mutal downloads from happening
+    eprintln!("Download block 0x{:x}", block_index);
+    let mut retryAttempts = 3;
 
-    let response = ebs_client
-        .get_snapshot_block()
-        .snapshot_id(snapshot_id)
-        .block_index(block_index)
-        .block_token(block_token)
-        .send()
-        .await
-        .context(error::GetSnapshotBlockSnafu {
-            snapshot_id,
-            block_index,
-        })?;
+    let response = loop {
+        retryAttempts -= 1;
+        let response = ebs_client
+            .get_snapshot_block()
+            .snapshot_id(snapshot_id)
+            .block_index(block_index)
+            .block_token(block_token)
+            .send();
+        let timeoutResp = timeout(Duration::from_secs(2), response).await;
+        match timeoutResp {
+            Ok(resp) => {
+                break resp
+                .context(error::GetSnapshotBlockSnafu {
+                    snapshot_id,
+                    block_index,
+                });
+            }
+            Err(e) => {
+                println!("timeout, attempts remaining {}", retryAttempts);
+                if retryAttempts <= 0 {
+                    break Err(error::Error::TimeoutError{ source: e });
+                }
+            }
+        }
+    }?;
+    println!("download block 0x{:x} done", block_index);
 
     let expected_hash = response.checksum.context(error::FindBlockPropertySnafu {
         snapshot_id,
@@ -341,7 +367,7 @@ impl SnapshotReader {
                 .context(error::ListSnapshotBlocksSnafu { snapshot_id })?;
 
             let blocks = response.blocks.unwrap_or_default();
-            println!("ListSnapshotBlocks {} - {}", blocks[0].block_index.unwrap(), blocks.last().unwrap().block_index.unwrap());
+            eprintln!("ListSnapshotBlocks {} - {}", blocks[0].block_index.unwrap(), blocks.last().unwrap().block_index.unwrap());
 
             for block in blocks.iter() {
                 let index = block
@@ -516,6 +542,7 @@ mod error {
     use snafu::Snafu;
     use std::path::PathBuf;
     use gpt::GptError;
+    use tokio::time::error::Elapsed;
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub(super)))]
@@ -537,6 +564,9 @@ mod error {
 
         #[snafu(display("{}", source))]
         GptError { source: GptError },
+
+        #[snafu(display("{}", source))]
+        TimeoutError { source: Elapsed },
 
         #[snafu(display("{}", source))]
         EyreError { source: color_eyre::eyre::Error },
